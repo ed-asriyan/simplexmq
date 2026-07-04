@@ -58,6 +58,7 @@ module Simplex.Messaging.Transport
     clientNoticesSMPVersion,
     rcvServiceSMPVersion,
     namesSMPVersion,
+    serverInfoSMPVersion,
     simplexMQVersion,
     smpBlockSize,
     TransportConfig (..),
@@ -108,7 +109,7 @@ module Simplex.Messaging.Transport
   )
 where
 
-import Control.Applicative (optional)
+import Control.Applicative (optional, (<|>))
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Except
@@ -173,6 +174,7 @@ smpBlockSize = 16384
 -- 17 - create notification credentials with NEW (7/12/2025)
 -- 18 - support client notices (10/10/2025)
 -- 19 - service subscriptions to messages (10/20/2025)
+-- 20 - server public information in handshake (7/5/2026)
 
 data SMPVersion
 
@@ -226,6 +228,9 @@ rcvServiceSMPVersion = VersionSMP 19
 
 namesSMPVersion :: VersionSMP
 namesSMPVersion = VersionSMP 20
+
+serverInfoSMPVersion :: VersionSMP
+serverInfoSMPVersion = VersionSMP 20
 
 minClientSMPRelayVersion :: VersionSMP
 minClientSMPRelayVersion = VersionSMP 6
@@ -496,7 +501,9 @@ data THandleParams v p = THandleParams
     -- based on protocol version
     batch :: Bool,
     -- | include service signature (or '0' if it is absent), based on protocol version
-    serviceAuth :: Bool
+    serviceAuth :: Bool,
+    -- | JSON-encoded ServerPublicInfo from handshake, present when server version >= serverInfoSMPVersion
+    serverInfoBytes :: Maybe ByteString
   }
 
 data THandleAuth (p :: TransportPeer) where
@@ -548,7 +555,9 @@ data SMPServerHandshake = SMPServerHandshake
     sessionId :: SessionId,
     -- pub key to agree shared secrets for command authorization and entity ID encryption.
     -- todo C.PublicKeyX25519
-    authPubKey :: Maybe CertChainPubKey
+    authPubKey :: Maybe CertChainPubKey,
+    -- | optional server public information (JSON-encoded ServerPublicInfo), sent when version >= serverInfoSMPVersion
+    serverInfo :: Maybe ByteString
   }
 
 -- This is the third handshake message that SMP server sends to services
@@ -638,16 +647,21 @@ ifHasProxy v a b = if v >= proxyServerHandshakeSMPVersion then a else b
 ifHasService :: VersionSMP -> a -> a -> a
 ifHasService v a b = if v >= serviceCertsSMPVersion then a else b
 
+ifHasServerInfo :: VersionSMP -> a -> a -> a
+ifHasServerInfo v a b = if v >= serverInfoSMPVersion then a else b
+
 instance Encoding SMPServerHandshake where
-  smpEncode SMPServerHandshake {smpVersionRange, sessionId, authPubKey} =
-    smpEncode (smpVersionRange, sessionId) <> auth
+  smpEncode SMPServerHandshake {smpVersionRange, sessionId, authPubKey, serverInfo} =
+    smpEncode (smpVersionRange, sessionId) <> auth <> info
     where
       auth = encodeAuthEncryptCmds (maxVersion smpVersionRange) authPubKey
+      info = ifHasServerInfo (maxVersion smpVersionRange) (smpEncode (Large <$> serverInfo)) ""
   smpP = do
     (smpVersionRange, sessionId) <- smpP
     -- TODO drop SMP v6: remove special parser and make key non-optional
     authPubKey <- authEncryptCmdsP (maxVersion smpVersionRange) smpP
-    pure SMPServerHandshake {smpVersionRange, sessionId, authPubKey}
+    serverInfo <- ifHasServerInfo (maxVersion smpVersionRange) ((fmap unLarge <$> smpP) <|> pure Nothing) (pure Nothing)
+    pure SMPServerHandshake {smpVersionRange, sessionId, authPubKey, serverInfo}
 
 -- newtype for CertificateChain and a session key signed with this certificate
 data CertChainPubKey = CertChainPubKey
@@ -763,12 +777,13 @@ smpServerHandshake ::
   C.KeyPairX25519 ->
   C.KeyHash ->
   VersionRangeSMP ->
+  Maybe ByteString ->
   (SMPServiceRole -> X.CertificateChain -> XV.Fingerprint -> ExceptT TransportError IO ServiceId) ->
   ExceptT TransportError IO (THandleSMP c 'TServer)
-smpServerHandshake srvCert srvSignKey c (k, pk) kh smpVRange getService = do
+smpServerHandshake srvCert srvSignKey c (k, pk) kh smpVRange serverInfo getService = do
   let sk = C.signX509 srvSignKey $ C.publicToX509 k
       smpVersionRange = maybe legacyServerSMPRelayVRange (const smpVRange) $ getSessionALPN c
-  sendHandshake th $ SMPServerHandshake {sessionId, smpVersionRange, authPubKey = Just (CertChainPubKey srvCert sk)}
+  sendHandshake th $ SMPServerHandshake {sessionId, smpVersionRange, authPubKey = Just (CertChainPubKey srvCert sk), serverInfo}
   SMPClientHandshake {smpVersion = v, keyHash, authPubKey = k', proxyServer, clientService} <- getHandshake th
   when (keyHash /= kh) $ throwE $ TEHandshake IDENTITY
   case compatibleVRange' smpVersionRange v of
@@ -801,7 +816,7 @@ smpServerHandshake srvCert srvSignKey c (k, pk) kh smpVRange getService = do
 -- See https://github.com/simplex-chat/simplexmq/blob/master/protocol/simplex-messaging.md#appendix-a
 smpClientHandshake :: forall c. Transport c => c 'TClient -> Maybe C.KeyPairX25519 -> C.KeyHash -> VersionRangeSMP -> Bool -> Maybe (ServiceCredentials, C.KeyPairEd25519) -> ExceptT TransportError IO (THandleSMP c 'TClient)
 smpClientHandshake c ks_ keyHash@(C.KeyHash kh) vRange proxyServer serviceKeys_ = do
-  SMPServerHandshake {sessionId = sessId, smpVersionRange, authPubKey} <- getHandshake th
+  SMPServerHandshake {sessionId = sessId, smpVersionRange, authPubKey, serverInfo} <- getHandshake th
   when (sessionId /= sessId) $ throwE TEBadSession
   -- Below logic downgrades version range in case the "client" is SMP proxy server and it is
   -- connected to the destination server of the version 11 or older.
@@ -838,7 +853,7 @@ smpClientHandshake c ks_ keyHash@(C.KeyHash kh) vRange proxyServer serviceKeys_ 
           hs = SMPClientHandshake {smpVersion = v, keyHash, authPubKey = fst <$> ks_, proxyServer, clientService}
       sendHandshake th hs
       service <- mapM getClientService serviceKeys
-      liftIO $ smpTHandleClient th v vr (snd <$> ks_) ck_ proxyServer service
+      liftIO $ smpTHandleClient th v vr (snd <$> ks_) ck_ proxyServer service serverInfo
     Nothing -> throwE TEVersion
   where
     th@THandle {params = THandleParams {sessionId}} = smpTHandle c
@@ -856,14 +871,14 @@ smpTHandleServer :: forall c. THandleSMP c 'TServer -> VersionSMP -> VersionRang
 smpTHandleServer th v vr pk k_ proxyServer peerClientService = do
   let thAuth = Just THAuthServer {serverPrivKey = pk, peerClientService, sessSecret' = (`C.dh'` pk) <$!> k_}
   be <- blockEncryption th v proxyServer thAuth
-  pure $ smpTHandle_ th v vr thAuth $ uncurry TSbChainKeys <$> be
+  pure $ smpTHandle_ th v vr thAuth (uncurry TSbChainKeys <$> be) Nothing
 
-smpTHandleClient :: forall c. THandleSMP c 'TClient -> VersionSMP -> VersionRangeSMP -> Maybe C.PrivateKeyX25519 -> Maybe (C.PublicKeyX25519, CertChainPubKey) -> Bool -> Maybe THClientService -> IO (THandleSMP c 'TClient)
-smpTHandleClient th v vr pk_ ck_ proxyServer clientService = do
+smpTHandleClient :: forall c. THandleSMP c 'TClient -> VersionSMP -> VersionRangeSMP -> Maybe C.PrivateKeyX25519 -> Maybe (C.PublicKeyX25519, CertChainPubKey) -> Bool -> Maybe THClientService -> Maybe ByteString -> IO (THandleSMP c 'TClient)
+smpTHandleClient th v vr pk_ ck_ proxyServer clientService serverInfoBytes = do
   let thAuth = clientTHParams <$!> ck_
   be <- blockEncryption th v proxyServer thAuth
   -- swap is needed to use client's sndKey as server's rcvKey and vice versa
-  pure $ smpTHandle_ th v vr thAuth $ uncurry TSbChainKeys . swap <$> be
+  pure $ smpTHandle_ th v vr thAuth (uncurry TSbChainKeys . swap <$> be) serverInfoBytes
   where
     clientTHParams (k, ck) =
       THAuthClient
@@ -883,8 +898,8 @@ blockEncryption THandle {params = THandleParams {sessionId}} v proxyServer = \ca
     be :: Maybe C.DhSecretX25519 -> IO (Maybe (TVar C.SbChainKey, TVar C.SbChainKey))
     be = mapM $ \(C.DhSecretX25519 secret) -> bimapM newTVarIO newTVarIO $ C.sbcInit sessionId secret
 
-smpTHandle_ :: forall c p. THandleSMP c p -> VersionSMP -> VersionRangeSMP -> Maybe (THandleAuth p) -> Maybe TSbChainKeys -> THandleSMP c p
-smpTHandle_ th@THandle {params} v vr thAuth encryptBlock =
+smpTHandle_ :: forall c p. THandleSMP c p -> VersionSMP -> VersionRangeSMP -> Maybe (THandleAuth p) -> Maybe TSbChainKeys -> Maybe ByteString -> THandleSMP c p
+smpTHandle_ th@THandle {params} v vr thAuth encryptBlock serverInfoBytes =
   -- TODO drop SMP v6: make thAuth non-optional
   -- * Note: update version-based parameters in smpTHParamsSetVersion as well.
   let params' =
@@ -894,7 +909,8 @@ smpTHandle_ th@THandle {params} v vr thAuth encryptBlock =
             thAuth,
             implySessId = v >= authCmdsSMPVersion,
             encryptBlock,
-            serviceAuth = v >= serviceCertsSMPVersion -- optional service signature will be encoded for all commands and responses
+            serviceAuth = v >= serviceCertsSMPVersion, -- optional service signature will be encoded for all commands and responses
+            serverInfoBytes
           }
    in (th :: THandleSMP c p) {params = params'}
 
@@ -933,7 +949,8 @@ smpTHandle c = THandle {connection = c, params}
           implySessId = False,
           encryptBlock = Nothing,
           batch = True,
-          serviceAuth = False
+          serviceAuth = False,
+          serverInfoBytes = Nothing
         }
 
 $(J.deriveJSON (sumTypeJSON id) ''HandshakeError)

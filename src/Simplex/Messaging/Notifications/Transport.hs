@@ -186,5 +186,6 @@ ntfTHandle c = THandle {connection = c, params}
           implySessId = False,
           encryptBlock = Nothing,
           batch = False,
-          serviceAuth = False
+          serviceAuth = False,
+          serverInfoBytes = Nothing
         }

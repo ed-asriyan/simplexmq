@@ -421,7 +421,8 @@ testTHandleParams v sessionId =
       implySessId = v >= authCmdsSMPVersion,
       encryptBlock = Nothing,
       batch = True,
-      serviceAuth = v >= serviceCertsSMPVersion
+      serviceAuth = v >= serviceCertsSMPVersion,
+      serverInfoBytes = Nothing
     }
 
 testTHandleAuth :: VersionSMP -> TVar ChaChaDRG -> C.APublicAuthKey -> IO (Maybe (THandleAuth 'TClient))
