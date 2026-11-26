@@ -332,6 +332,11 @@ supportedSMPClientVRange = mkVersionRange initialSMPClientVersion currentSMPClie
 maxMessageLength :: Int
 maxMessageLength = 16048 -- max 16048
 
+-- | Servers before v7.1 accepted message bodies up to this size from clients with SMP versions before 8,
+-- and up to 16064 bytes before 11, so stored messages can be larger than 'maxMessageLength'.
+storedMessageLength :: Int
+storedMessageLength = 16088
+
 paddedProxiedTLength :: Int
 paddedProxiedTLength = 16226 -- 16225 .. 16227
 
@@ -903,8 +908,11 @@ instance StrEncoding Message where
       msgQuotaP msgId msgTs = "quota" $> MessageQuota {msgId, msgTs}
       msgP msgId msgTs = do
         msgFlags <- ("flags=" *> strP_) <|> pure noMsgFlags
-        msgBody <- strP <|> (C.unsafeMaxLenBS "" <$ A.endOfInput)
+        msgBody <- storedMsgBody <$?> (strP <|> ("" <$ A.endOfInput))
         pure Message {msgId, msgTs, msgFlags, msgBody}
+      storedMsgBody s
+        | B.length s <= storedMessageLength = Right $ C.unsafeMaxLenBS s
+        | otherwise = Left "message body is too large"
 
 type EncNMsgMeta = ByteString
 

@@ -3,6 +3,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -23,12 +24,16 @@ import Control.Monad.IO.Class
 import Control.Monad.Trans.Except
 import Crypto.Random (ChaChaDRG)
 import Data.ByteString.Char8 (ByteString)
+import qualified Data.ByteString.Char8 as B
+import Data.Either (isLeft)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as M
 import Data.Time.Clock.System (SystemTime (..), getSystemTime)
 import Simplex.Messaging.Crypto (pattern MaxLenBS)
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Protocol (EncDataBytes (..), EntityId (..), ErrorType (..), LinkId, Message (..), NotifierId, QueueLinkData, RecipientId, SParty (..), noMsgFlags, randomMsgId)
+import Simplex.Messaging.Encoding.String
+import Simplex.Messaging.Server.MsgStore (MsgLogRecord (..))
 import Simplex.Messaging.Server.MsgStore.STM
 import Simplex.Messaging.Server.MsgStore.Types
 import Simplex.Messaging.Server.NtfStore
@@ -63,6 +68,7 @@ msgStoreTests = do
     someMsgStoreTests testSMTStoreConfig
     it "should remove deleted queues from queue store maps" $ withMsgStore testSMTStoreConfig testDeleteQueueMaps
     it "should time out store log write" testStoreLogTimeout
+    it "should parse stored messages up to the size accepted by servers before v7.1" testStoredMessageLength
 #if defined(dbServerPostgres)
   describe "Postgres-only message store" $ do
     someMsgStoreTests testPostgresStoreConfig
@@ -328,6 +334,20 @@ testDeleteQueueMaps ms = do
   queueMapSizes ms `shouldReturn` (0, 0, 0, 0)
   where
     expectAuth = either (`shouldBe` AUTH) (\_ -> expectationFailure "deleted queue is still found")
+
+testStoredMessageLength :: IO ()
+testStoredMessageLength = do
+  g <- C.newRandom
+  msgId <- atomically $ randomMsgId 24 g
+  msgTs <- getSystemTime
+  let bodyLength n =
+        strDecode (strEncode $ MLRv3 (EntityId "1234") Message {msgId, msgTs, msgFlags = noMsgFlags, msgBody = C.unsafeMaxLenBS $ B.replicate n 'a'}) >>= \case
+          MLRv3 _ Message {msgBody = MaxLenBS s} -> Right $ B.length s
+          MLRv3 _ MessageQuota {} -> Left "quota"
+  bodyLength 0 `shouldBe` Right 0
+  bodyLength 16048 `shouldBe` Right 16048
+  bodyLength 16088 `shouldBe` Right 16088
+  bodyLength 16089 `shouldSatisfy` isLeft
 
 testStoreLogTimeout :: HasTestEnv => IO ()
 testStoreLogTimeout = do
