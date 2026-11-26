@@ -1570,33 +1570,35 @@ testRestoreMessages =
 
 testRestoreLargeMessages :: SpecWith (ASrvTransport, AStoreType)
 testRestoreLargeMessages =
-  it "should restore and deliver messages larger than the current limit, stored by servers before v7.1" $ \(at@(ATransport t), msType) -> case msType of
-    ASType _ SMSPostgres -> pure ()
-    ASType _ SMSMemory -> do
-      removeFileIfExists testStoreLogFile
-      removeFileIfExists testStoreMsgsFile
-      g <- C.newRandom
-      (sPub, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
-      let (cfg', _) = serverStoreLogCfg msType
-      (rId, rKey, dh) <- withSmpServerConfigOn at cfg' testPort . runTest t $ \h -> do
-        (_, rId, rKey, dh) <- createAndSecureQueue h sPub
-        pure (rId, rKey, dh)
-      ts <- getSystemTime
-      msgIds <- atomically $ replicateM 2 $ randomMsgId 24 g
-      let bodies = [B.replicate maxMessageLength 'a', B.replicate 16088 'b']
-          msgLog = B.unlines $ zipWith (\msgId body -> strEncode $ MLRv3 rId Message {msgId, msgTs = ts, msgFlags = noMsgFlags, msgBody = C.unsafeMaxLenBS body}) msgIds bodies
-      B.writeFile testStoreMsgsFile msgLog
-      withSmpServerConfigOn at cfg' testPort . runTest t $ \h -> do
-        let dec = decryptMsgV3 dh
-        (Resp "1" _ (SOK Nothing), Resp "" _ (Msg mId1 msg1)) <- signSendRecv2 h rKey ("1", rId, SUB)
-        (dec mId1 msg1, Right $ B.replicate maxMessageLength 'a') #== "restored message delivered"
-        Resp "2" _ (Msg mId2 msg2) <- signSendRecv h rKey ("2", rId, ACK mId1)
-        (dec mId2 msg2, Right $ B.replicate 16088 'b') #== "restored large message delivered"
-        Resp "3" _ OK <- signSendRecv h rKey ("3", rId, ACK mId2)
-        pure ()
-      removeFileIfExists testStoreLogFile
-      removeFileIfExists testStoreMsgsFile
+  it "should restore and deliver messages larger than the current limit, stored by servers before v7.1" $ \(at, msType) -> restoreLargeMessages at msType
   where
+    restoreLargeMessages :: HasTestEnv => ASrvTransport -> AStoreType -> Expectation
+    restoreLargeMessages at@(ATransport t) msType = case msType of
+      ASType _ SMSPostgres -> pure ()
+      ASType _ SMSMemory -> do
+        removeFileIfExists testStoreLogFile
+        removeFileIfExists testStoreMsgsFile
+        g <- C.newRandom
+        (sPub, _) <- atomically $ C.generateAuthKeyPair C.SEd25519 g
+        let (cfg', _) = serverStoreLogCfg msType
+        (rId, rKey, dh) <- withSmpServerConfigOn at cfg' testPort . runTest t $ \h -> do
+          (_, rId, rKey, dh) <- createAndSecureQueue h sPub
+          pure (rId, rKey, dh)
+        ts <- getSystemTime
+        msgIds <- atomically $ replicateM 2 $ randomMsgId 24 g
+        let bodies = [B.replicate maxMessageLength 'a', B.replicate 16088 'b']
+            msgLog = B.unlines $ zipWith (\msgId body -> strEncode $ MLRv3 rId Message {msgId, msgTs = ts, msgFlags = noMsgFlags, msgBody = C.unsafeMaxLenBS body}) msgIds bodies
+        B.writeFile testStoreMsgsFile msgLog
+        withSmpServerConfigOn at cfg' testPort . runTest t $ \h -> do
+          let dec = decryptMsgV3 dh
+          (Resp "1" _ (SOK Nothing), Resp "" _ (Msg mId1 msg1)) <- signSendRecv2 h rKey ("1", rId, SUB)
+          (dec mId1 msg1, Right $ B.replicate maxMessageLength 'a') #== "restored message delivered"
+          Resp "2" _ (Msg mId2 msg2) <- signSendRecv h rKey ("2", rId, ACK mId1)
+          (dec mId2 msg2, Right $ B.replicate 16088 'b') #== "restored large message delivered"
+          Resp "3" _ OK <- signSendRecv h rKey ("3", rId, ACK mId2)
+          pure ()
+        removeFileIfExists testStoreLogFile
+        removeFileIfExists testStoreMsgsFile
     runTest :: (HasTestEnv, Transport c) => TProxy c 'TServer -> (THandleSMP c 'TClient -> IO a) -> ThreadId -> IO a
     runTest _ test' server = testSMPClient test' `finally` killThread server
 
